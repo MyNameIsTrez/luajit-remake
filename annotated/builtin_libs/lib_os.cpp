@@ -15,7 +15,7 @@ inline TValue IndexTable(VM* vm, HeapPtr<TableObject> tbl, std::string_view key)
 // TODO: Linker error caused on `ThrowError` call, so macro must be used
 // `x = tbl[x] or error(msg)`
 #define IndexValueOrError(vm, tbl, key, err) \
-    ({ \
+    __extension__ ({ \
         TValue val = IndexTable(vm, tbl, key); \
         if (val.IsNil()) \
         { \
@@ -59,7 +59,7 @@ inline void SetTableValue(VM* vm, HeapPtr<TableObject> tbl, std::string_view key
 DEEGEN_DEFINE_LIB_FUNC(os_clock)
 {
     // Direct rip from luajit: https://github.com/LuaJIT/LuaJIT/blob/v2.1/src/lib_os.c#L127
-    Return(TValue::Create<tDouble>((clock()) * (1.0 / CLOCKS_PER_SEC)));
+    Return(TValue::Create<tDouble>(static_cast<double>(clock()) * (1.0 / CLOCKS_PER_SEC)));
 }
 
 // os.date -- https://www.lua.org/manual/5.1/manual.html#pdf-os.date
@@ -155,9 +155,9 @@ DEEGEN_DEFINE_LIB_FUNC(os_date)
         //calculating how much size is needed, in LuaJIT (and replicated here) this is done by iterating the format, and for every instance of `%`, adding 30
         //https://github.com/LuaJIT/LuaJIT/blob/v2.1/src/lib_os.c#L211
         size_t siz = 1;
-        for (const char *fmt_ptr = fmt; *fmt; fmt++)
+        for (const char *fmt_ptr = fmt; *fmt_ptr; fmt_ptr++)
         {
-            siz += *fmt == '%' ? 30 : 1;
+            siz += *fmt_ptr == '%' ? 30 : 1;
         }
 
         auto buf = new char[siz];
@@ -188,7 +188,10 @@ DEEGEN_DEFINE_LIB_FUNC(os_difftime)
     if (GetNumArgs() > 1 && GetArg(1).IsDouble())
         a2 = GetArg(1).ViewAsDouble();
 
-    Return(TValue::Create<tDouble>(difftime(GetArg(0).ViewAsDouble(), a2)));
+    Return(TValue::Create<tDouble>(
+        difftime(static_cast<time_t>(GetArg(0).ViewAsDouble()),
+                 static_cast<time_t>(a2))
+    ));
 }
 
 // os.execute -- https://www.lua.org/manual/5.1/manual.html#pdf-os.execute
