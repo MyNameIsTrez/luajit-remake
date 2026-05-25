@@ -1,5 +1,83 @@
 #include "deegen_api.h"
 #include "runtime_utils.h"
+#include <vector>
+
+// Easy way to index tables
+inline TValue IndexTable(VM* vm, HeapPtr<TableObject> tbl, std::string_view key)
+{
+    UserHeapPointer<HeapString> hs = vm->CreateStringObjectFromRawString(key.data(), static_cast<uint32_t>(key.length()));
+
+    GetByIdICInfo icInfo;
+    TableObject::PrepareGetById(tbl, hs, icInfo);
+    return TableObject::GetById(tbl, hs.As<void>(), icInfo);
+}
+
+// Easy way to set table values
+template<typename TValueType, typename T>
+inline void SetTableValue(VM* vm, HeapPtr<TableObject> tbl, std::string_view key, T value)
+{
+    UserHeapPointer<HeapString> hs = vm->CreateStringObjectFromRawString(key.data(), static_cast<uint32_t>(key.length()));
+
+    PutByIdICInfo icInfo;
+    TableObject::PreparePutById(tbl, hs, icInfo);
+    TableObject::PutById(tbl, hs.As<void>(), TValue::Create<TValueType>(value), icInfo);
+}
+
+// Easy way to set raw TValues in tables (useful for inserting closures/functions directly)
+inline void SetTableTValue(VM* vm, HeapPtr<TableObject> tbl, std::string_view key, TValue val)
+{
+    UserHeapPointer<HeapString> hs = vm->CreateStringObjectFromRawString(key.data(), static_cast<uint32_t>(key.length()));
+
+    PutByIdICInfo icInfo;
+    TableObject::PreparePutById(tbl, hs, icInfo);
+    TableObject::PutById(tbl, hs.As<void>(), val, icInfo);
+}
+
+enum class FileHandleStatus {
+    Valid,
+    Closed,
+    Invalid
+};
+
+// Extract a FILE* from a table if it has fp_low and fp_high. Returns status to avoid calling ThrowError outside of DEEGEN macros.
+static FileHandleStatus TryExtractFileHandle(VM* vm, TValue val, FILE** outFp)
+{
+    if (!val.Is<tTable>()) return FileHandleStatus::Invalid;
+
+    HeapPtr<TableObject> tbl = val.As<tTable>();
+    TValue valLow = IndexTable(vm, tbl, "fp_low");
+    TValue valHigh = IndexTable(vm, tbl, "fp_high");
+
+    if (valLow.IsNil() || valHigh.IsNil()) return FileHandleStatus::Invalid;
+
+    uint32_t low = static_cast<uint32_t>(valLow.AsInt32());
+    uint32_t high = static_cast<uint32_t>(valHigh.AsInt32());
+    
+    if (low == 0 && high == 0)
+    {
+        return FileHandleStatus::Closed;
+    }
+
+    uintptr_t ptrVal = (static_cast<uintptr_t>(high) << 32) | low;
+    *outFp = reinterpret_cast<FILE*>(ptrVal);
+    return FileHandleStatus::Valid;
+}
+
+// Populates methods on a file table so `file:read(...)` works exactly like `io.read(file, ...)`
+// We fetch the functions dynamically from the global 'io' table to avoid modifying vm.h
+static void PopulateFileTableMethods(VM* vm, HeapPtr<TableObject> tbl)
+{
+    TValue ioTableVal = IndexTable(vm, vm->GetRootGlobalObject(), "io");
+    if (ioTableVal.Is<tTable>())
+    {
+        HeapPtr<TableObject> ioTbl = ioTableVal.As<tTable>();
+        SetTableTValue(vm, tbl, "read", IndexTable(vm, ioTbl, "read"));
+        SetTableTValue(vm, tbl, "write", IndexTable(vm, ioTbl, "write"));
+        SetTableTValue(vm, tbl, "close", IndexTable(vm, ioTbl, "close"));
+        SetTableTValue(vm, tbl, "flush", IndexTable(vm, ioTbl, "flush"));
+        SetTableTValue(vm, tbl, "lines", IndexTable(vm, ioTbl, "lines"));
+    }
+}
 
 // io.close -- https://www.lua.org/manual/5.1/manual.html#pdf-io.close
 //
@@ -8,7 +86,42 @@
 //
 DEEGEN_DEFINE_LIB_FUNC(io_close)
 {
-    ThrowError("Library function 'io.close' is not implemented yet!");
+    VM* vm = VM::GetActiveVMForCurrentThread();
+    FILE* fp = stdout;
+    HeapPtr<TableObject> tbl = nullptr;
+
+    if (GetNumArgs() > 0 && !GetArg(0).Is<tNil>())
+    {
+        FileHandleStatus status = TryExtractFileHandle(vm, GetArg(0), &fp);
+        if (status == FileHandleStatus::Invalid)
+        {
+            ThrowError("bad argument #1 to 'close' (file handle expected)");
+        }
+        else if (status == FileHandleStatus::Closed)
+        {
+            ThrowError("attempt to use a closed file");
+        }
+        tbl = GetArg(0).As<tTable>();
+    }
+
+    int ret = fclose(fp);
+
+    if (tbl != nullptr)
+    {
+        // Mark as closed
+        SetTableValue<tInt32>(vm, tbl, "fp_low", 0);
+        SetTableValue<tInt32>(vm, tbl, "fp_high", 0);
+    }
+
+    if (ret != 0)
+    {
+        int en = errno;
+        Return(TValue::Create<tNil>(), TValue::Create<tString>(vm->CreateStringObjectFromRawCString(strerror(en))), TValue::Create<tInt32>(en));
+    }
+    else
+    {
+        Return(TValue::Create<tBool>(true));
+    }
 }
 
 // io.flush -- https://www.lua.org/manual/5.1/manual.html#pdf-io.flush
@@ -18,18 +131,39 @@ DEEGEN_DEFINE_LIB_FUNC(io_close)
 //
 DEEGEN_DEFINE_LIB_FUNC(io_flush)
 {
-    ThrowError("Library function 'io.flush' is not implemented yet!");
+    VM* vm = VM::GetActiveVMForCurrentThread();
+    FILE* fp = stdout;
+
+    if (GetNumArgs() > 0)
+    {
+        FILE* extractedFp = nullptr;
+        FileHandleStatus status = TryExtractFileHandle(vm, GetArg(0), &extractedFp);
+        if (status == FileHandleStatus::Invalid)
+        {
+            ThrowError("bad argument #1 to 'flush' (file handle expected)");
+        }
+        else if (status == FileHandleStatus::Closed)
+        {
+            ThrowError("attempt to use a closed file");
+        }
+        fp = extractedFp;
+    }
+
+    int ret = fflush(fp);
+    if (ret != 0)
+    {
+        int en = errno;
+        Return(TValue::Create<tNil>(), TValue::Create<tString>(vm->CreateStringObjectFromRawCString(strerror(en))), TValue::Create<tInt32>(en));
+    }
+    else
+    {
+        Return(TValue::Create<tBool>(true));
+    }
 }
 
 // io.input -- https://www.lua.org/manual/5.1/manual.html#pdf-io.input
 //
 // io.input ([file])
-// When called with a file name, it opens the named file (in text mode), and sets its handle as the default input file.
-// When called with a file handle, it simply sets this file handle as the default input file.
-// When called without parameters, it returns the current default input file.
-//
-// In case of errors this function raises the error, instead of returning an error code.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_input)
 {
     ThrowError("Library function 'io.input' is not implemented yet!");
@@ -42,23 +176,14 @@ DEEGEN_DEFINE_LIB_FUNC(io_input)
 //
 static size_t WARN_UNUSED TryReadLineOnce(FILE* fp, char* buf, size_t limit)
 {
-    // Set up a sentry value so we know if 'fgets' read exactly 'limit' bytes
-    //
     buf[limit] = 1;
-
-    // Let fgets read at most 'limit' bytes and append the '\0'
-    //
     char* fgetsRet = fgets(buf, static_cast<int>(limit + 1), fp);
+    
     if (unlikely(fgetsRet == nullptr))
     {
-        // EOF without any bytes read, or error. For error just treat it as EOF for now.
-        //
         return static_cast<size_t>(-2);
     }
 
-    // If our sentry value 1 is not overwritten, it means 'fgets' stopped short before reading 'x_internalBufferSize' characters.
-    // So a newline (or EOF) must have been encountered. We can quit now.
-    //
     if (buf[limit] != '\0')
     {
         size_t len = strlen(buf);
@@ -70,26 +195,16 @@ static size_t WARN_UNUSED TryReadLineOnce(FILE* fp, char* buf, size_t limit)
         return len;
     }
 
-    // Now we know fgets has read exactly 'limit' characters.
-    //
     if (buf[limit - 1] == '\n')
     {
-        // The line (including '\n') happens to have exactly 'limit' bytes.
-        //
         return limit - 1;
     }
 
-    // The line might have more to read.
-    // (Note that it is possible that we have reached EOF here and the file doesn't end with a newline,
-    // but we won't know until we call fgets again).
-    //
     return static_cast<size_t>(-1);
 }
 
 static HeapPtr<HeapString> NO_INLINE ReadLinesSlowPath(FILE* fp, VM* vm, char* firstChunk, size_t firstChunkLen)
 {
-    // Just use a vector for simplicity now
-    //
     std::vector<std::pair<const void*, size_t>> chunkList;
     chunkList.push_back(std::make_pair(firstChunk, firstChunkLen));
 
@@ -100,31 +215,22 @@ static HeapPtr<HeapString> NO_INLINE ReadLinesSlowPath(FILE* fp, VM* vm, char* f
         size_t len = TryReadLineOnce(fp, buf, x_chunkSize);
         if (len == static_cast<size_t>(-2))
         {
-            // It means we reached EOF and the file did not end with a newline, we are done.
-            // We didn't read in anything useful in this iteration.
-            //
             chunkList.push_back(std::make_pair(buf, 0));
             break;
         }
         if (len == static_cast<size_t>(-1))
         {
-            // We read in full x_chunkSize bytes but still may have more to read.
-            //
             chunkList.push_back(std::make_pair(buf, x_chunkSize));
             continue;
         }
 
         assert(len < x_chunkSize);
-        // We found a newline or EOF, we are done.
-        //
         chunkList.push_back(std::make_pair(buf, len));
         break;
     }
 
     HeapPtr<HeapString> result = vm->CreateStringObjectFromConcatenation(chunkList.data(), chunkList.size()).As();
 
-    // The first element in 'chunkList' is the internal buffer, we must not free it. Free everything else.
-    //
     for (size_t i = 1; i < chunkList.size(); i++)
     {
         char* ptr = const_cast<char*>(reinterpret_cast<const char*>(chunkList[i].first));
@@ -154,20 +260,6 @@ DEEGEN_DEFINE_LIB_FUNC(io_lines_iter)
 }
 
 // io.lines -- https://www.lua.org/manual/5.1/manual.html#pdf-io.lines
-//
-// io.lines ([filename])
-// Opens the given file name in read mode and returns an iterator function that, each time it is called, returns a new line
-// from the file. Therefore, the construction
-//     for line in io.lines(filename) do body end
-// will iterate over all lines of the file. When the iterator function detects the end of file, it returns nil (to finish the
-// loop) and automatically closes the file.
-//
-// The call io.lines() (with no file name) is equivalent to io.input():lines(); that is, it iterates over the lines of the
-// default input file. In this case it does not close the file when the loop ends.
-//
-// TODO: This is a makeshift implementation. This is not standard conforming.
-// Currently we are always read from stdin and does not support file input.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_lines)
 {
     if (GetNumArgs() > 0 && !GetArg(0).Is<tNil>())
@@ -180,42 +272,58 @@ DEEGEN_DEFINE_LIB_FUNC(io_lines)
 // io.open -- https://www.lua.org/manual/5.1/manual.html#pdf-io.open
 //
 // io.open (filename [, mode])
-// This function opens a file, in the mode specified in the string mode. It returns a new file handle, or, in case of errors,
-// nil plus an error message.
-//
-// The mode string can be any of the following:
-//     "r": read mode (the default);
-//     "w": write mode;
-//     "a": append mode;
-//     "r+": update mode, all previous data is preserved;
-//     "w+": update mode, all previous data is erased;
-//     "a+": append update mode, previous data is preserved, writing is only allowed at the end of file.
-// The mode string can also have a 'b' at the end, which is needed in some systems to open the file in binary mode. This string
-// is exactly what is used in the standard C function fopen.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_open)
 {
-    ThrowError("Library function 'io.open' is not implemented yet!");
+    if (unlikely(GetNumArgs() == 0))
+    {
+        ThrowError("bad argument #1 to 'open' (string expected, got no value)");
+    }
+    if (unlikely(!GetArg(0).Is<tString>()))
+    {
+        ThrowError("bad argument #1 to 'open' (string expected)");
+    }
+
+    VM* vm = VM::GetActiveVMForCurrentThread();
+    HeapString* hs = TranslateToRawPointer(vm, GetArg(0).As<tString>());
+    
+    const char* mode = "r";
+    if (GetNumArgs() > 1 && !GetArg(1).Is<tNil>())
+    {
+        if (unlikely(!GetArg(1).Is<tString>()))
+        {
+            ThrowError("bad argument #2 to 'open' (string expected)");
+        }
+        HeapString* modeHs = TranslateToRawPointer(vm, GetArg(1).As<tString>());
+        mode = reinterpret_cast<const char*>(modeHs->m_string);
+    }
+
+    FILE* fp = fopen(reinterpret_cast<const char*>(hs->m_string), mode);
+    if (fp == nullptr)
+    {
+        int en = errno;
+        Return(TValue::Create<tNil>(), TValue::Create<tString>(vm->CreateStringObjectFromRawCString(strerror(en))), TValue::Create<tInt32>(en));
+    }
+
+    HeapPtr<TableObject> tbl = TableObject::CreateEmptyTableObject(vm, 7, 0); // Need room for methods + keys
+    uintptr_t ptrVal = reinterpret_cast<uintptr_t>(fp);
+    uint32_t low = static_cast<uint32_t>(ptrVal & 0xFFFFFFFF);
+    uint32_t high = static_cast<uint32_t>((ptrVal >> 32) & 0xFFFFFFFF);
+    
+    SetTableValue<tInt32>(vm, tbl, "fp_low", static_cast<int32_t>(low));
+    SetTableValue<tInt32>(vm, tbl, "fp_high", static_cast<int32_t>(high));
+    
+    PopulateFileTableMethods(vm, tbl);
+
+    Return(TValue::Create<tTable>(tbl));
 }
 
 // io.output -- https://www.lua.org/manual/5.1/manual.html#pdf-io.output
-//
-// io.output ([file])
-// Similar to io.input, but operates over the default output file.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_output)
 {
     ThrowError("Library function 'io.output' is not implemented yet!");
 }
 
 // io.popen -- https://www.lua.org/manual/5.1/manual.html#pdf-io.popen
-//
-// io.popen (prog [, mode])
-// Starts program prog in a separated process and returns a file handle that you can use to read data from this program (if mode is
-// "r", the default) or to write data to this program (if mode is "w").
-//
-// This function is system dependent and is not available on all platforms.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_popen)
 {
     ThrowError("Library function 'io.popen' is not implemented yet!");
@@ -228,45 +336,132 @@ DEEGEN_DEFINE_LIB_FUNC(io_popen)
 //
 DEEGEN_DEFINE_LIB_FUNC(io_read)
 {
-    ThrowError("Library function 'io.read' is not implemented yet!");
+    VM* vm = VM::GetActiveVMForCurrentThread();
+    FILE* fp = stdin; // Fallback default to standard input
+    uint32_t argIdx = 0;
+
+    // Handle being called as a method (file:read)
+    if (GetNumArgs() > argIdx)
+    {
+        FILE* extractedFp = nullptr;
+        FileHandleStatus status = TryExtractFileHandle(vm, GetArg(argIdx), &extractedFp);
+        
+        if (status == FileHandleStatus::Closed)
+        {
+            ThrowError("attempt to use a closed file");
+        }
+        else if (status == FileHandleStatus::Valid)
+        {
+            fp = extractedFp;
+            argIdx++;
+        }
+        // If status is Invalid, it's just standard input with formatting args like io.read("*a")
+    }
+
+    bool readAll = false;
+    if (GetNumArgs() > argIdx && GetArg(argIdx).Is<tString>())
+    {
+        HeapString* fmtHs = TranslateToRawPointer(vm, GetArg(argIdx).As<tString>());
+        const char* fmt = reinterpret_cast<const char*>(fmtHs->m_string);
+        if (strcmp(fmt, "*a") == 0 || strcmp(fmt, "a") == 0)
+        {
+            readAll = true;
+        }
+    }
+
+    if (readAll)
+    {
+        std::vector<std::pair<const void*, size_t>> chunkList;
+        constexpr size_t x_chunkSize = 65280;
+        while (true)
+        {
+            char* buf = new char[x_chunkSize];
+            size_t n = fread(buf, 1, x_chunkSize, fp);
+            if (n == 0)
+            {
+                delete[] buf;
+                break;
+            }
+            chunkList.push_back(std::make_pair(buf, n));
+            if (n < x_chunkSize)
+            {
+                break;
+            }
+        }
+
+        if (chunkList.empty())
+        {
+            Return(TValue::Create<tString>(vm->CreateStringObjectFromRawCString("")));
+        }
+        else
+        {
+            HeapPtr<HeapString> result = vm->CreateStringObjectFromConcatenation(chunkList.data(), chunkList.size()).As();
+            for (size_t i = 0; i < chunkList.size(); i++)
+            {
+                char* ptr = const_cast<char*>(reinterpret_cast<const char*>(chunkList[i].first));
+                delete[] ptr;
+            }
+            Return(TValue::Create<tString>(result));
+        }
+    }
+    else
+    {
+        constexpr size_t x_internalBufferSize = 8192;
+        char internalBuf[x_internalBufferSize + 1];
+        size_t len = TryReadLineOnce(fp, internalBuf, x_internalBufferSize);
+        if (len == static_cast<size_t>(-2))
+        {
+            Return(TValue::Create<tNil>());
+        }
+        if (len != static_cast<size_t>(-1))
+        {
+            assert(len < x_internalBufferSize);
+            Return(TValue::Create<tString>(vm->CreateStringObjectFromRawString(internalBuf, static_cast<uint32_t>(len)).As()));
+        }
+        HeapPtr<HeapString> result = ReadLinesSlowPath(fp, vm, internalBuf, x_internalBufferSize);
+        Return(TValue::Create<tString>(result));
+    }
 }
 
 // io.tmpfile -- https://www.lua.org/manual/5.1/manual.html#pdf-io.tmpfile
-//
-// io.tmpfile ()
-// Returns a handle for a temporary file. This file is opened in update mode and it is automatically removed when the program ends.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_tmpfile)
 {
     ThrowError("Library function 'io.tmpfile' is not implemented yet!");
 }
 
 // io.type -- https://www.lua.org/manual/5.1/manual.html#pdf-io.type
-//
-// io.type (obj)
-// Checks whether obj is a valid file handle. Returns the string "file" if obj is an open file handle, "closed file" if obj is a
-// closed file handle, or nil if obj is not a file handle.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_type)
 {
     ThrowError("Library function 'io.type' is not implemented yet!");
 }
 
 // io.write -- https://www.lua.org/manual/5.1/manual.html#pdf-io.write
-//
-// io.write (···)
-// Equivalent to io.output():write.
-//
-// TODO: This is a makeshift implementation. This is not standard conforming.
-// Currently we are always printing to stdout.
-//
 DEEGEN_DEFINE_LIB_FUNC(io_write)
 {
     VM* vm = VM::GetActiveVMForCurrentThread();
     FILE* fp = vm->GetStdout();
+    uint32_t argIdx = 0;
+
+    // Handle being called as a method (file:write)
+    if (GetNumArgs() > argIdx)
+    {
+        FILE* extractedFp = nullptr;
+        FileHandleStatus status = TryExtractFileHandle(vm, GetArg(argIdx), &extractedFp);
+        
+        if (status == FileHandleStatus::Closed)
+        {
+            ThrowError("attempt to use a closed file");
+        }
+        else if (status == FileHandleStatus::Valid)
+        {
+            fp = extractedFp;
+            argIdx++;
+        }
+    }
+
     size_t numElementsToPrint = GetNumArgs();
     bool success = true;
-    for (uint32_t i = 0; i < numElementsToPrint; i++)
+    for (uint32_t i = argIdx; i < numElementsToPrint; i++)
     {
         TValue val = GetArg(i);
 #if 0
@@ -297,7 +492,6 @@ DEEGEN_DEFINE_LIB_FUNC(io_write)
         }
         else
         {
-            // TODO: make error message consistent with Lua
             ThrowError("bad argument to 'write' (string expected)");
         }
     }

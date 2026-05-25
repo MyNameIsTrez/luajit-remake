@@ -2,6 +2,17 @@
 #include "lualib_tonumber_util.h"
 #include "runtime_utils.h"
 #include "lj_strfmt.h"
+#include <cstdio>
+#include <cstdlib>
+
+// This function works around static helper functions getting the linker error
+// `error: undefined reference to 'DeegenImpl_ThrowErrorCString'`
+// when they try and call ThrowError(), for some reason.
+[[noreturn]] static void my_err(const char *msg)
+{
+    fprintf(stderr, "My error: %s\n", msg);
+    exit(EXIT_FAILURE);
+}
 
 // string.byte -- https://www.lua.org/manual/5.1/manual.html#pdf-string.byte
 //
@@ -150,6 +161,322 @@ DEEGEN_DEFINE_LIB_FUNC(string_dump)
     ThrowError("Library function 'string.dump' is not implemented yet!");
 }
 
+// ------------------------------------------------------------------------
+// Pattern Matching Engine Core Infrastructure
+// ------------------------------------------------------------------------
+
+#define L_ESC '%'
+#define CAP_UNFINISHED (-1)
+#define CAP_POSITION (-2)
+constexpr int LUA_MAXCAPTURES = 32;
+constexpr int LJ_MAX_XLEVEL = 200;
+
+struct MatchState {
+    const char* src_init;
+    const char* src_end;
+    int level;
+    int depth;
+    struct {
+        const char* init;
+        ptrdiff_t len;
+    } capture[LUA_MAXCAPTURES];
+};
+
+static bool match_class(int c, int cl)
+{
+    bool res;
+    switch (std::tolower(cl))
+    {
+        case 'a': res = std::isalpha(c); break;
+        case 'c': res = std::iscntrl(c); break;
+        case 'd': res = std::isdigit(c); break;
+        case 'g': res = std::isgraph(c); break;
+        case 'l': res = std::islower(c); break;
+        case 'p': res = std::ispunct(c); break;
+        case 's': res = std::isspace(c); break;
+        case 'u': res = std::isupper(c); break;
+        case 'w': res = std::isalnum(c); break;
+        case 'x': res = std::isxdigit(c); break;
+        case 'z': res = (c == 0); break;
+        default:  return (cl == c);
+    }
+    return std::isupper(cl) ? !res : res;
+}
+
+static const char* classend(const char* p)
+{
+    switch (*p++)
+    {
+        case L_ESC:
+            if (unlikely(*p == '\0'))
+            {
+                my_err("malformed pattern (ends with '%')");
+            }
+            return p + 1;
+        case '[':
+            if (*p == '^') p++;
+            do {
+                if (unlikely(*p == '\0'))
+                {
+                    my_err("malformed pattern (missing ']')");
+                }
+                if (*(p++) == L_ESC && *p != '\0') p++;
+            } while (*p != ']');
+            return p + 1;
+        default:
+            return p;
+    }
+}
+
+static bool matchbracketclass(int c, const char* p, const char* ec)
+{
+    bool sig = true;
+    if (*(p + 1) == '^')
+    {
+        sig = false;
+        p++;
+    }
+    while (++p < ec)
+    {
+        if (*p == L_ESC)
+        {
+            p++;
+            if (match_class(c, static_cast<unsigned char>(*p))) return sig;
+        }
+        else if ((*(p + 1) == '-') && (p + 2 < ec))
+        {
+            p += 2;
+            if (static_cast<unsigned char>(*(p - 2)) <= c && c <= static_cast<unsigned char>(*p)) return sig;
+        }
+        else if (static_cast<unsigned char>(*p) == c)
+        {
+            return sig;
+        }
+    }
+    return !sig;
+}
+
+static bool singlematch(int c, const char* p, const char* ep)
+{
+    switch (*p)
+    {
+        case '.': return true;
+        case L_ESC: return match_class(c, static_cast<unsigned char>(*(p + 1)));
+        case '[': return matchbracketclass(c, p, ep - 1);
+        default:  return (static_cast<unsigned char>(*p) == c);
+    }
+}
+
+static const char* match(MatchState* ms, const char* s, const char* p);
+
+static const char* matchbalance(MatchState* ms, const char* s, const char* p)
+{
+    if (unlikely(*p == 0 || *(p + 1) == 0))
+    {
+        my_err("malformed pattern (missing arguments to '%b')");
+    }
+    if (*s != *p) return nullptr;
+    int b = *p;
+    int e = *(p + 1);
+    int cont = 1;
+    while (++s < ms->src_end)
+    {
+        if (*s == e)
+        {
+            if (--cont == 0) return s + 1;
+        }
+        else if (*s == b)
+        {
+            cont++;
+        }
+    }
+    return nullptr;
+}
+
+static const char* max_expand(MatchState* ms, const char* s, const char* p, const char* ep)
+{
+    ptrdiff_t i = 0;
+    while ((s + i) < ms->src_end && singlematch(static_cast<unsigned char>(*(s + i)), p, ep))
+    {
+        i++;
+    }
+    while (i >= 0)
+    {
+        const char* res = match(ms, s + i, ep + 1);
+        if (res) return res;
+        i--;
+    }
+    return nullptr;
+}
+
+static const char* min_expand(MatchState* ms, const char* s, const char* p, const char* ep)
+{
+    for (;;)
+    {
+        const char* res = match(ms, s, ep + 1);
+        if (res != nullptr) return res;
+        if (s < ms->src_end && singlematch(static_cast<unsigned char>(*s), p, ep))
+        {
+            s++;
+        }
+        else
+        {
+            return nullptr;
+        }
+    }
+}
+
+static int check_capture(MatchState* ms, int l)
+{
+    l -= '1';
+    if (unlikely(l < 0 || l >= ms->level || ms->capture[l].len == CAP_UNFINISHED))
+    {
+        my_err("invalid capture index");
+    }
+    return l;
+}
+
+static int capture_to_close(MatchState* ms)
+{
+    int level = ms->level;
+    for (level--; level >= 0; level--)
+    {
+        if (ms->capture[level].len == CAP_UNFINISHED) return level;
+    }
+    my_err("invalid pattern capture to close");
+}
+
+static const char* start_capture(MatchState* ms, const char* s, const char* p, int what)
+{
+    int level = ms->level;
+    if (unlikely(level >= LUA_MAXCAPTURES))
+    {
+        my_err("too many captures");
+    }
+    ms->capture[level].init = s;
+    ms->capture[level].len = what;
+    ms->level = level + 1;
+    const char* res = match(ms, s, p);
+    if (res == nullptr) ms->level--;
+    return res;
+}
+
+static const char* end_capture(MatchState* ms, const char* s, const char* p)
+{
+    int l = capture_to_close(ms);
+    ms->capture[l].len = s - ms->capture[l].init;
+    const char* res = match(ms, s, p);
+    if (res == nullptr) ms->capture[l].len = CAP_UNFINISHED;
+    return res;
+}
+
+static const char* match_capture(MatchState* ms, const char* s, int l)
+{
+    l = check_capture(ms, l);
+    size_t len = static_cast<size_t>(ms->capture[l].len);
+    if (static_cast<size_t>(ms->src_end - s) >= len && memcmp(ms->capture[l].init, s, len) == 0)
+    {
+        return s + len;
+    }
+    return nullptr;
+}
+
+static const char* match(MatchState* ms, const char* s, const char* p)
+{
+    if (unlikely(++ms->depth > LJ_MAX_XLEVEL))
+    {
+        my_err("pattern matching nested too deeply");
+    }
+init:
+    switch (*p)
+    {
+        case '(':
+            if (*(p + 1) == ')') s = start_capture(ms, s, p + 2, CAP_POSITION);
+            else s = start_capture(ms, s, p + 1, CAP_UNFINISHED);
+            break;
+        case ')':
+            s = end_capture(ms, s, p + 1);
+            break;
+        case L_ESC:
+            switch (*(p + 1))
+            {
+                case 'b':
+                    s = matchbalance(ms, s, p + 2);
+                    if (s == nullptr) break;
+                    p += 4;
+                    goto init;
+                case 'f': {
+                    p += 2;
+                    if (unlikely(*p != '[')) my_err("missing '[' after '%f' in pattern");
+                    const char* ep = classend(p);
+                    char previous = (s == ms->src_init) ? '\0' : *(s - 1);
+                    if (matchbracketclass(static_cast<unsigned char>(previous), p, ep - 1) ||
+                        !matchbracketclass(static_cast<unsigned char>(*s), p, ep - 1))
+                    {
+                        s = nullptr;
+                        break;
+                    }
+                    p = ep;
+                    goto init;
+                }
+                default:
+                    if (std::isdigit(static_cast<unsigned char>(*(p + 1))))
+                    {
+                        s = match_capture(ms, s, static_cast<unsigned char>(*(p + 1)));
+                        if (s == nullptr) break;
+                        p += 2;
+                        goto init;
+                    }
+                    goto dflt;
+            }
+            break;
+        case '\0':
+            break;
+        case '$':
+            if (*(p + 1) != '\0') goto dflt;
+            if (s != ms->src_end) s = nullptr;
+            break;
+        default: dflt: {
+            const char* ep = classend(p);
+            bool m = s < ms->src_end && singlematch(static_cast<unsigned char>(*s), p, ep);
+            switch (*ep)
+            {
+                case '?': {
+                    const char* res;
+                    if (m && ((res = match(ms, s + 1, ep + 1)) != nullptr))
+                    {
+                        s = res;
+                        break;
+                    }
+                    p = ep + 1;
+                    goto init;
+                }
+                case '*':
+                    s = max_expand(ms, s, p, ep);
+                    break;
+                case '+':
+                    s = (m ? max_expand(ms, s + 1, p, ep) : nullptr);
+                    break;
+                case '-':
+                    s = min_expand(ms, s, p, ep);
+                    break;
+                default:
+                    if (m)
+                    {
+                        s++;
+                        p = ep;
+                        goto init;
+                    }
+                    s = nullptr;
+                    break;
+            }
+            break;
+        }
+    }
+    ms->depth--;
+    return s;
+}
+
 // string.find -- https://www.lua.org/manual/5.1/manual.html#pdf-string.find
 //
 // string.find (s, pattern [, init [, plain]])
@@ -163,7 +490,120 @@ DEEGEN_DEFINE_LIB_FUNC(string_dump)
 //
 DEEGEN_DEFINE_LIB_FUNC(string_find)
 {
-    ThrowError("Library function 'string.find' is not implemented yet!");
+    size_t numArgs = GetNumArgs();
+    if (unlikely(numArgs < 2))
+    {
+        ThrowError("bad argument #2 to 'find' (string expected, got no value)");
+    }
+
+    GET_ARG_AS_STRING(find_s, 1, s, sLen);
+
+    // Bypass the macro redefinition of `macro_argN2SBuf` safely inline
+    #define macro_argN2SBuf macro_argN2SBuf_p
+    GET_ARG_AS_STRING(find_p, 2, p, pLen);
+    #undef macro_argN2SBuf
+
+    int64_t initPos = 1;
+    if (numArgs >= 3)
+    {
+        TValue tvInit = GetArg(2);
+        auto [success, val] = LuaLib_ToNumber(tvInit);
+        if (unlikely(!success))
+        {
+            ThrowError("bad argument #3 to 'find' (number expected)");
+        }
+        initPos = static_cast<int64_t>(val);
+    }
+
+    bool plain = false;
+    if (numArgs >= 4)
+    {
+        // Treat any non-nil provided value as truthy
+        TValue tvPlain = GetArg(3);
+        plain = !tvPlain.IsNil();
+    }
+
+    int64_t len = static_cast<int64_t>(sLen);
+    if (initPos < 0) { initPos += len + 1; }
+    if (initPos <= 0) { initPos = 1; }
+    if (initPos > len)
+    {
+        if (initPos > len + 1 || pLen > 0)
+        {
+            Return(TValue::Create<tNil>());
+        }
+    }
+
+    if (plain)
+    {
+        if (pLen == 0)
+        {
+            TValue* sb = GetStackBase();
+            sb[0] = TValue::Create<tDouble>(static_cast<double>(initPos));
+            sb[1] = TValue::Create<tDouble>(static_cast<double>(initPos - 1));
+            ReturnValueRange(sb, 2);
+        }
+        const char* haystack = s + initPos - 1;
+        size_t haystackLen = sLen - static_cast<size_t>(initPos - 1);
+        std::string_view hView(haystack, haystackLen);
+        std::string_view pView(p, pLen);
+        size_t pos = hView.find(pView);
+        if (pos != std::string_view::npos)
+        {
+            int64_t startIdx = initPos + static_cast<int64_t>(pos);
+            int64_t endIdx = startIdx + static_cast<int64_t>(pLen) - 1;
+            TValue* sb = GetStackBase();
+            sb[0] = TValue::Create<tDouble>(static_cast<double>(startIdx));
+            sb[1] = TValue::Create<tDouble>(static_cast<double>(endIdx));
+            ReturnValueRange(sb, 2);
+        }
+        Return(TValue::Create<tNil>());
+    }
+
+    const char* sstr = s + initPos - 1;
+    const char* pstr = p;
+    bool anchor = false;
+    if (*pstr == '^')
+    {
+        pstr++;
+        anchor = true;
+    }
+
+    MatchState ms;
+    ms.src_init = s;
+    ms.src_end = s + sLen;
+    VM* vm = VM::GetActiveVMForCurrentThread();
+
+    do
+    {
+        ms.level = 0;
+        ms.depth = 0;
+        const char* q = match(&ms, sstr, pstr);
+        if (q != nullptr)
+        {
+            int64_t startIdx = (sstr - s) + 1;
+            int64_t endIdx = q - s;
+            TValue* sb = GetStackBase();
+            sb[0] = TValue::Create<tDouble>(static_cast<double>(startIdx));
+            sb[1] = TValue::Create<tDouble>(static_cast<double>(endIdx));
+
+            for (int i = 0; i < ms.level; i++)
+            {
+                if (ms.capture[i].len == CAP_POSITION)
+                {
+                    sb[2 + i] = TValue::Create<tDouble>(static_cast<double>(ms.capture[i].init - ms.src_init + 1));
+                }
+                else
+                {
+                    HeapPtr<HeapString> res = vm->CreateStringObjectFromRawString(ms.capture[i].init, static_cast<uint32_t>(ms.capture[i].len)).As();
+                    sb[2 + i] = TValue::Create<tString>(res);
+                }
+            }
+            ReturnValueRange(sb, static_cast<size_t>(2 + ms.level));
+        }
+    } while (sstr++ <= ms.src_end && !anchor);
+
+    Return(TValue::Create<tNil>());
 }
 
 // string.format -- https://www.lua.org/manual/5.1/manual.html#pdf-string.format
@@ -292,9 +732,170 @@ DEEGEN_DEFINE_LIB_FUNC(string_gmatch)
 //     x = string.gsub("$name-$version.tar.gz", "%$(%w+)", t)
 //     --> x="lua-5.1.tar.gz"
 //
+#include <cstring>
+#include <cctype>
+
+// Helper to append to SimpleTempStringStream safely
+static void AppendToStream(SimpleTempStringStream& ss, const char* data, size_t len)
+{
+    if (len == 0) return;
+    char* ptr = ss.Reserve(len);
+    memcpy(ptr, data, len);
+    ss.Update(ptr + len);
+}
+
+// FIX: Accept HeapPtr<HeapString> directly and index into it.
+// This allows the compiler to handle the managed memory access.
+static void add_gsub_repl_string(SimpleTempStringStream& ss, MatchState* ms, HeapPtr<HeapString> repl, const char* s, const char* match_end)
+{
+    uint32_t replLen = repl->m_length;
+    for (uint32_t i = 0; i < replLen; i++)
+    {
+        // Accessing m_string[i] is safe because the compiler handles 
+        // the address space translation for member access.
+        uint8_t c = repl->m_string[i];
+
+        if (c == '%' && i + 1 < replLen)
+        {
+            uint8_t next = repl->m_string[i + 1];
+            i++; // consume the %
+            
+            if (isdigit(static_cast<unsigned char>(next)))
+            {
+                int capture_idx = next - '1';
+                if (capture_idx == -1) // %0: full match
+                {
+                    AppendToStream(ss, s, static_cast<size_t>(match_end - s));
+                }
+                else if (capture_idx < ms->level && ms->capture[capture_idx].len != CAP_UNFINISHED)
+                {
+                    AppendToStream(ss, ms->capture[capture_idx].init, static_cast<size_t>(ms->capture[capture_idx].len));
+                }
+                else
+                {
+                    my_err("invalid capture index in replacement string");
+                }
+            }
+            else if (next == '%')
+            {
+                AppendToStream(ss, "%", 1);
+            }
+            else
+            {
+                my_err("invalid use of '%' in replacement string");
+            }
+        }
+        else
+        {
+            char ch = static_cast<char>(c);
+            AppendToStream(ss, &ch, 1);
+        }
+    }
+}
+
 DEEGEN_DEFINE_LIB_FUNC(string_gsub)
 {
-    ThrowError("Library function 'string.gsub' is not implemented yet!");
+    size_t numArgs = GetNumArgs();
+    if (numArgs < 3)
+    {
+        ThrowError("bad arguments to 'gsub' (expected at least 3 arguments)");
+    }
+
+    GET_ARG_AS_STRING(gsub_s, 1, s, sLen);
+
+    #define macro_argN2SBuf macro_argN2SBuf_p
+    GET_ARG_AS_STRING(gsub_p, 2, p, pLen);
+    (void)pLen;
+    #undef macro_argN2SBuf
+
+    TValue repl = GetArg(3);
+
+    int64_t max_n = -1;
+    if (numArgs >= 4)
+    {
+        TValue tvN = GetArg(4);
+        auto [success, val] = LuaLib_ToNumber(tvN);
+        if (unlikely(!success))
+        {
+            ThrowError("bad argument #4 to 'gsub' (number expected)");
+        }
+        max_n = static_cast<int64_t>(val);
+    }
+
+    VM* vm = VM::GetActiveVMForCurrentThread();
+    SimpleTempStringStream ss;
+    MatchState ms;
+    ms.src_init = s;
+    ms.src_end = s + sLen;
+
+    const char* curr = s;
+    int64_t n_matches = 0;
+
+    while (max_n < 0 || n_matches < max_n)
+    {
+        ms.level = 0;
+        ms.depth = 0;
+        const char* e = match(&ms, curr, p);
+
+        if (e != nullptr)
+        {
+            n_matches++;
+            AppendToStream(ss, curr, static_cast<size_t>(e - curr));
+
+            if (repl.Is<tString>())
+            {
+                HeapPtr<HeapString> hs = repl.As<tString>();
+                // FIX: Simply pass the HeapPtr; the helper handles indexing
+                add_gsub_repl_string(ss, &ms, hs, curr, e);
+            }
+            else if (repl.Is<tTable>())
+            {
+                ThrowError("gsub with table not yet implemented");
+            }
+            else if (repl.Is<tFunction>())
+            {
+                ThrowError("gsub with function not yet implemented");
+            }
+            else
+            {
+                 ThrowError("bad argument #3 to 'gsub' (string/function/table expected)");
+            }
+
+            if (e == curr)
+            {
+                if (curr < ms.src_end)
+                {
+                    AppendToStream(ss, curr, 1);
+                    curr++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            else
+            {
+                curr = e;
+            }
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    if (curr < ms.src_end)
+    {
+        AppendToStream(ss, curr, static_cast<size_t>(ms.src_end - curr));
+    }
+
+    HeapPtr<HeapString> res = vm->CreateStringObjectFromRawString(ss.m_bufferBegin, static_cast<uint32_t>(ss.Len())).As();
+    ss.Destroy();
+
+    TValue* sb = GetStackBase();
+    sb[0] = TValue::Create<tString>(res);
+    sb[1] = TValue::Create<tDouble>(static_cast<double>(n_matches));
+    ReturnValueRange(sb, 2);
 }
 
 // string.len -- https://www.lua.org/manual/5.1/manual.html#pdf-string.len
@@ -490,7 +1091,82 @@ DEEGEN_DEFINE_LIB_FUNC(string_lower)
 //
 DEEGEN_DEFINE_LIB_FUNC(string_match)
 {
-    ThrowError("Library function 'string.match' is not implemented yet!");
+    size_t numArgs = GetNumArgs();
+    if (unlikely(numArgs < 2))
+    {
+        ThrowError("bad argument #2 to 'match' (string expected, got no value)");
+    }
+
+    GET_ARG_AS_STRING(match_s, 1, s, sLen);
+
+    // Bypass the macro redefinition of `macro_argN2SBuf` safely inline
+    #define macro_argN2SBuf macro_argN2SBuf_p
+    GET_ARG_AS_STRING(match_p, 2, p, pLen);
+    (void)pLen;
+    #undef macro_argN2SBuf
+
+    int64_t initPos = 1;
+    if (numArgs >= 3)
+    {
+        TValue tvInit = GetArg(2);
+        auto [success, val] = LuaLib_ToNumber(tvInit);
+        if (unlikely(!success))
+        {
+            ThrowError("bad argument #3 to 'match' (number expected)");
+        }
+        initPos = static_cast<int64_t>(val);
+    }
+
+    int64_t len = static_cast<int64_t>(sLen);
+    if (initPos < 0) { initPos += len + 1; }
+    if (initPos <= 0) { initPos = 1; }
+    if (initPos > len + 1) { initPos = len + 1; }
+
+    const char* sstr = s + initPos - 1;
+    const char* pstr = p;
+    bool anchor = false;
+    if (*pstr == '^')
+    {
+        pstr++;
+        anchor = true;
+    }
+
+    MatchState ms;
+    ms.src_init = s;
+    ms.src_end = s + sLen;
+    VM* vm = VM::GetActiveVMForCurrentThread();
+
+    do
+    {
+        ms.level = 0;
+        ms.depth = 0;
+        const char* q = match(&ms, sstr, pstr);
+        if (q != nullptr)
+        {
+            if (ms.level == 0)
+            {
+                Return(TValue::Create<tString>(vm->CreateStringObjectFromRawString(sstr, static_cast<uint32_t>(q - sstr)).As()));
+            }
+            else
+            {
+                TValue* sb = GetStackBase();
+                for (int i = 0; i < ms.level; i++)
+                {
+                    if (ms.capture[i].len == CAP_POSITION)
+                    {
+                        sb[i] = TValue::Create<tDouble>(static_cast<double>(ms.capture[i].init - ms.src_init + 1));
+                    }
+                    else
+                    {
+                        sb[i] = TValue::Create<tString>(vm->CreateStringObjectFromRawString(ms.capture[i].init, static_cast<uint32_t>(ms.capture[i].len)).As());
+                    }
+                }
+                ReturnValueRange(sb, static_cast<size_t>(ms.level));
+            }
+        }
+    } while (sstr++ < ms.src_end && !anchor);
+
+    Return(TValue::Create<tNil>());
 }
 
 // string.rep -- https://www.lua.org/manual/5.1/manual.html#pdf-string.rep
